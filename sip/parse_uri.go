@@ -63,6 +63,11 @@ func uriStateSlashes(uri *Uri, s string) (uriFSM, string, error) {
 func uriStateUser(uri *Uri, s string) (uriFSM, string, error) {
 	var userend int = 0
 	for i, c := range s {
+		if c == '[' {
+			// IPV6
+			return uriStateHost, s[i:], nil
+		}
+
 		if c == ':' {
 			userend = i
 		}
@@ -83,6 +88,11 @@ func uriStateUser(uri *Uri, s string) (uriFSM, string, error) {
 
 func uriStateHost(uri *Uri, s string) (uriFSM, string, error) {
 	for i, c := range s {
+		if c == '[' {
+			return uriStateHostIPV6, s[i:], nil
+		}
+
+		// TODO this part gets repeated on IPV6
 		if c == ':' {
 			uri.Host = s[:i]
 			return uriStatePort, s[i+1:], nil
@@ -105,6 +115,41 @@ func uriStateHost(uri *Uri, s string) (uriFSM, string, error) {
 	return uriStateUriParams, "", nil
 }
 
+func uriStateHostIPV6(uri *Uri, s string) (uriFSM, string, error) {
+	// ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff max 39
+	// Do not waste time looking end
+	maxs := min(len(s), 40)
+
+	ind := strings.Index(s[:maxs], "]")
+	if ind <= 0 {
+		return nil, s, fmt.Errorf("IPV6 no closing bracket")
+	}
+	uri.Host = s[:ind+1]
+
+	if ind+1 == len(s) {
+		// finished
+		return uriStateUriParams, "", nil
+	}
+
+	s = s[ind+1:]
+
+	// Check now termination
+	c := s[0]
+	if c == ':' {
+		return uriStatePort, s[1:], nil
+	}
+
+	if c == ';' {
+		return uriStateUriParams, s[1:], nil
+	}
+
+	if c == '?' {
+		return uriStateHeaders, s[1:], nil
+	}
+
+	return uriStateUriParams, "", nil
+}
+
 func uriStatePort(uri *Uri, s string) (uriFSM, string, error) {
 	var err error
 	for i, c := range s {
@@ -120,7 +165,7 @@ func uriStatePort(uri *Uri, s string) (uriFSM, string, error) {
 	}
 
 	uri.Port, err = strconv.Atoi(s)
-	return nil, s, err
+	return uriStateUriParams, "", err
 }
 
 func uriStateUriParams(uri *Uri, s string) (uriFSM, string, error) {

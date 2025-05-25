@@ -5,11 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
-
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -25,18 +23,20 @@ var (
 type transportUDP struct {
 	// listener *net.UDPConn
 	parser *Parser
-
-	pool *ConnectionPool
-	log  zerolog.Logger
+	pool   *ConnectionPool
+	log    *slog.Logger
 }
 
-func newUDPTransport(par *Parser) *transportUDP {
-	p := &transportUDP{
-		parser: par,
-		pool:   NewConnectionPool(),
+func (t *transportUDP) init(par *Parser) {
+	t.parser = par
+	t.pool = NewConnectionPool()
+	if t.log == nil {
+		t.log = slog.Default()
 	}
-	p.log = log.Logger.With().Str("caller", "transport<UDP>").Logger()
-	return p
+}
+
+func (t *transportUDP) setLogger(log *slog.Logger) {
+	t.log = log
 }
 
 func (t *transportUDP) String() string {
@@ -48,15 +48,13 @@ func (t *transportUDP) Network() string {
 }
 
 func (t *transportUDP) Close() error {
-	t.pool.Clear()
+	return t.pool.Clear()
 	// Closing listeners is caller thing.
-	return nil
 }
 
 // ServeConn is direct way to provide conn on which this worker will listen
 func (t *transportUDP) Serve(conn net.PacketConn, handler MessageHandler) error {
-
-	t.log.Debug().Msgf("begin listening on %s %s", t.Network(), conn.LocalAddr().String())
+	t.log.Debug("begin listening", "network", t.Network(), "addr", conn.LocalAddr().String())
 	/*
 		Multiple readers makes problem, which can delay writing response
 	*/
@@ -76,16 +74,12 @@ func (t *transportUDP) ResolveAddr(addr string) (net.Addr, error) {
 }
 
 // GetConnection will return same listener connection
-func (t *transportUDP) GetConnection(addr string) (Connection, error) {
+func (t *transportUDP) GetConnection(addr string) Connection {
 	// Single udp connection as listener can only be used as long IP of a packet in same network
 	// In case this is not the case we should return error?
 	// https://dadrian.io/blog/posts/udp-in-go/
 	// Pool consists either of every new packet From addr or client created connection
-	if conn := t.pool.Get(addr); conn != nil {
-		return conn, nil
-	}
-
-	return nil, nil
+	return t.pool.Get(addr)
 }
 
 // CreateConnection will create new connection
@@ -119,7 +113,7 @@ func (t *transportUDP) createConnection(ctx context.Context, laddr Addr, raddr A
 	}
 
 	addr := raddr.String()
-	t.log.Debug().Str("raddr", addr).Msg("New connection")
+	t.log.Debug("New connection", "raddr", addr)
 
 	// Add in pool but as listen connection
 	// Reason is that UDP connection can be reused.
@@ -181,8 +175,12 @@ func (t *transportUDP) readUDPConnection(conn *UDPConnection, raddr string, ladd
 
 func (t *transportUDP) readListenerConnection(conn *UDPConnection, laddr string, handler MessageHandler) {
 	buf := make([]byte, TransportBufferReadSize)
-	defer t.pool.CloseAndDelete(conn, laddr)
-	defer t.log.Debug().Str("addr", laddr).Msg("Read listener connection stopped")
+	defer func() {
+		if err := t.pool.CloseAndDelete(conn, laddr); err != nil {
+			t.log.Warn("connection pool not clean cleanup", "error", err)
+		}
+	}()
+	defer t.log.Debug("Read listener connection stopped", "laddr", laddr)
 
 	var lastRaddr string
 	// NOTE: consider to refactor, but for cleanup
@@ -196,10 +194,10 @@ func (t *transportUDP) readListenerConnection(conn *UDPConnection, laddr string,
 		num, raddr, err := conn.ReadFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				t.log.Debug().Str("addr", laddr).Err(err).Msg("Read connection closed")
+				t.log.Debug("Read connection closed", "laddr", laddr, "error", err)
 				return
 			}
-			t.log.Error().Str("addr", laddr).Err(err).Msg("Read connection error")
+			t.log.Error("Read connection error", "laddr", laddr, "error", err)
 			return
 		}
 
@@ -279,14 +277,14 @@ func (t *transportUDP) parseAndHandle(data []byte, src string, handler MessageHa
 	if len(data) <= 4 {
 		//One or 2 CRLF
 		if len(bytes.Trim(data, "\r\n")) == 0 {
-			t.log.Debug().Msg("Keep alive CRLF received")
+			t.log.Debug("Keep alive CRLF received")
 			return
 		}
 	}
 
 	msg, err := t.parser.ParseSIP(data) //Very expensive operation
 	if err != nil {
-		t.log.Error().Err(err).Str("data", string(data)).Msg("failed to parse")
+		t.log.Error("failed to parse", "data", string(data), "error", err)
 		return
 	}
 
@@ -316,7 +314,7 @@ func (c *UDPConnection) close() error {
 	c.mu.Unlock()
 
 	if c.Conn != nil {
-		log.Debug().Str("ip", c.LocalAddr().String()).Str("dst", c.Conn.RemoteAddr().String()).Int("ref", 0).Msg("UDP doing hard close")
+		slog.Debug("UDP doing hard close", "ip", c.LocalAddr().String(), "dst", c.Conn.RemoteAddr().String(), "ref", 0)
 		return c.Conn.Close()
 	}
 
@@ -325,7 +323,7 @@ func (c *UDPConnection) close() error {
 		// Closing is done by read connection and it will return already error
 		return nil
 	}
-	log.Debug().Str("ip", c.LocalAddr().String()).Int("ref", 0).Msg("UDP listener doing hard close")
+	slog.Debug("UDP listener doing hard close", "ip", c.LocalAddr().String(), "ref", 0)
 	return c.PacketConn.Close()
 }
 
@@ -366,13 +364,13 @@ func (c *UDPConnection) TryClose() (int, error) {
 		return ref, nil
 	}
 
-	log.Debug().Str("src", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", ref).Msg("UDP reference decrement")
+	slog.Debug("UDP reference decrement", "src", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", ref)
 	if ref > 0 {
 		return ref, nil
 	}
 
 	if ref < 0 {
-		log.Warn().Str("src", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", ref).Msg("UDP ref went negative")
+		slog.Warn("UDP ref went negative", "src", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", ref)
 		return 0, nil
 	}
 

@@ -3,13 +3,12 @@ package sipgo
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
 	"github.com/icholy/digest"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 func Init() {
@@ -25,7 +24,9 @@ type Client struct {
 	host  string
 	port  int
 	rport bool
-	log   zerolog.Logger
+	log   *slog.Logger
+
+	connAddr sip.Addr
 
 	// TxRequester allows you to use your transaction requester instead default from transaction layer
 	// Useful only for testing
@@ -37,7 +38,7 @@ type Client struct {
 type ClientOption func(c *Client) error
 
 // WithClientLogger allows customizing client logger
-func WithClientLogger(logger zerolog.Logger) ClientOption {
+func WithClientLogger(logger *slog.Logger) ClientOption {
 	return func(s *Client) error {
 		s.log = logger
 		return nil
@@ -45,8 +46,6 @@ func WithClientLogger(logger zerolog.Logger) ClientOption {
 }
 
 // WithClientHost allows setting default route host or IP on Via
-// in case of IP it will enforce transport layer to create/reuse connection with this IP
-// This is useful when you need to act as client first and avoid creating server handle listeners.
 // NOTE: From header hostname is WithUserAgentHostname option on UA or modify request manually
 func WithClientHostname(hostname string) ClientOption {
 	return func(s *Client) error {
@@ -56,13 +55,28 @@ func WithClientHostname(hostname string) ClientOption {
 }
 
 // WithClientPort allows setting default route Via port
-// it will enforce transport layer to create connection with this port if does NOT exist
-// transport layer will choose existing connection by default unless
 // TransportLayer.ConnectionReuse is set to false
 // default: ephemeral port
 func WithClientPort(port int) ClientOption {
 	return func(s *Client) error {
 		s.port = port
+		return nil
+	}
+}
+
+// WithClientConnectionAddr forces request to send connection with this local addr.
+// This is useful when you need to act as client first and avoid creating server handle listeners.
+func WithClientConnectionAddr(hostPort string) ClientOption {
+	return func(s *Client) error {
+		host, port, err := sip.ParseAddr(hostPort)
+		if err != nil {
+			return err
+		}
+		s.connAddr = sip.Addr{
+			IP:       net.ParseIP(host),
+			Port:     port,
+			Hostname: host,
+		}
 		return nil
 	}
 }
@@ -94,7 +108,7 @@ func WithClientAddr(addr string) ClientOption {
 func NewClient(ua *UserAgent, options ...ClientOption) (*Client, error) {
 	c := &Client{
 		UserAgent: ua,
-		log:       log.Logger.With().Str("caller", "Client").Logger(),
+		log:       slog.With("caller", "Client"),
 	}
 
 	for _, o := range options {
@@ -150,6 +164,15 @@ func (c *Client) TransactionRequest(ctx context.Context, req *sip.Request, optio
 			return nil, err
 		}
 	}
+
+	// Do some request validation, but only place as warning
+	// The Content-Length header field value is used to locate the end of
+	//   each SIP message in a stream.  It will always be present when SIP
+	//   messages are sent over stream-oriented transports.
+	if sip.IsReliable(req.Transport()) && req.ContentLength() == nil {
+		c.log.Warn("Missing Content-Length for reliable transport")
+	}
+
 	return c.requestTransaction(ctx, req)
 }
 
@@ -164,8 +187,8 @@ func (c *Client) requestTransaction(ctx context.Context, req *sip.Request) (sip.
 // It returns on final response.
 // NOTE: Canceling ctx WILL not send Cancel Request which is needed for INVITE. Use dialog API for dealing with dialogs
 // For more lower API use TransactionRequest directly
-func (c *Client) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	tx, err := c.TransactionRequest(ctx, req)
+func (c *Client) Do(ctx context.Context, req *sip.Request, opts ...ClientRequestOption) (*sip.Response, error) {
+	tx, err := c.TransactionRequest(ctx, req, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -194,9 +217,33 @@ type DigestAuth struct {
 	Password string
 }
 
-// DoDigestAuth will apply digest authentication if initial request is chalenged by 401 or 407.
+// DoDigestAuth  will apply digest authentication if initial request is chalenged by 401 or 407.
+func (c *Client) DoDigestAuth(ctx context.Context, req *sip.Request, res *sip.Response, auth DigestAuth) (*sip.Response, error) {
+	tx, err := c.TransactionDigestAuth(ctx, req, res, auth)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Terminate()
+	for {
+		select {
+		case res := <-tx.Responses():
+			if res.IsProvisional() {
+				continue
+			}
+			return res, nil
+
+		case <-tx.Done():
+			return nil, tx.Err()
+
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// TransactionDigestAuth will apply digest authentication if initial request is chalenged by 401 or 407.
 // It returns new transaction that is created for this request
-func (c *Client) DoDigestAuth(ctx context.Context, req *sip.Request, res *sip.Response, auth DigestAuth) (sip.ClientTransaction, error) {
+func (c *Client) TransactionDigestAuth(ctx context.Context, req *sip.Request, res *sip.Response, auth DigestAuth) (sip.ClientTransaction, error) {
 	if res.StatusCode == sip.StatusProxyAuthRequired {
 		return digestProxyAuthRequest(ctx, c, req, res, digest.Options{
 			Method:   req.Method.String(),
@@ -234,13 +281,21 @@ func (c *Client) digestTransactionRequest(ctx context.Context, req *sip.Request,
 func (c *Client) WriteRequest(req *sip.Request, options ...ClientRequestOption) error {
 	if len(options) == 0 {
 		clientRequestBuildReq(c, req)
-		return c.tp.WriteMsg(req)
+		return c.writeReq(req)
 	}
 
 	for _, o := range options {
 		if err := o(c, req); err != nil {
 			return err
 		}
+	}
+	return c.writeReq(req)
+}
+
+func (c *Client) writeReq(req *sip.Request) error {
+	if c.TxRequester != nil {
+		_, err := c.TxRequester.Request(context.TODO(), req)
+		return err
 	}
 	return c.tp.WriteMsg(req)
 }
@@ -333,6 +388,12 @@ func clientRequestBuildReq(c *Client, req *sip.Request) error {
 		req.SetBody(nil)
 	}
 
+	// Set local addr, transport layer will check is present
+	if c.connAddr.IP != nil {
+		// Doing a copy to avoid dangling ip
+		c.connAddr.Copy(&req.Laddr)
+	}
+
 	return nil
 }
 
@@ -377,7 +438,6 @@ func clientRequestCreateVia(c *Client, r *sip.Request) *sip.ViaHeader {
 	// A client that sends a request to a multicast address MUST add the
 	// "maddr" parameter to its Via header field value containing the
 	// destination multicast address
-
 	newvia := &sip.ViaHeader{
 		ProtocolName:    "SIP",
 		ProtocolVersion: "2.0",
@@ -434,7 +494,6 @@ func ClientRequestAddRecordRoute(c *Client, r *sip.Request) error {
 func ClientRequestDecreaseMaxForward(c *Client, r *sip.Request) error {
 	maxfwd := r.MaxForwards()
 	if maxfwd == nil {
-		// TODO, should we return error here
 		return nil
 	}
 

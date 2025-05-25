@@ -89,6 +89,22 @@ func (s *DialogServerSession) Do(ctx context.Context, req *sip.Request) (*sip.Re
 // https://www.rfc-editor.org/rfc/rfc3261#section-12.2.1
 // This ensures that you have proper request done within dialog
 func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	s.buildReq(req)
+	// Passing option to avoid CSEQ apply
+	return s.ua.Client.TransactionRequest(ctx, req, func(c *Client, req *sip.Request) error {
+		if req.Via() == nil {
+			ClientRequestAddVia(c, req)
+		}
+		return nil
+	})
+}
+
+func (s *DialogServerSession) WriteRequest(req *sip.Request) error {
+	s.buildReq(req)
+	return s.ua.Client.WriteRequest(req)
+}
+
+func (s *DialogServerSession) buildReq(req *sip.Request) {
 	// Keep any request inside dialog
 	mustHaveHeaders := make([]sip.Header, 0, 5)
 	if h, invH := req.From(), s.InviteResponse; h == nil && invH != nil {
@@ -142,7 +158,6 @@ func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.R
 	if rr := req.Route(); rr != nil {
 		req.SetDestination(rr.Address.HostPort())
 	}
-
 	// TODO check correct behavior strict routing vs loose routing
 	// recordRoute := req.RecordRoute()
 	// if recordRoute != nil {
@@ -173,13 +188,7 @@ func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.R
 
 	// TODO check is contact header routable
 	// If not then we should force destination as source address
-
-	// Passing option to avoid CSEQ apply
-	return s.ua.Client.TransactionRequest(ctx, req, ClientRequestBuild)
-}
-
-func (s *DialogServerSession) WriteRequest(req *sip.Request) error {
-	return s.ua.Client.WriteRequest(req)
+	req.SetTransport(s.InviteRequest.Transport())
 }
 
 // Close is always good to call for cleanup or terminating dialog state
@@ -195,7 +204,7 @@ func (s *DialogServerSession) Close() error {
 // 2xx for creating dialog or other code in case failure
 //
 // In case Cancel request received: ErrDialogCanceled is responded
-func (s *DialogServerSession) Respond(statusCode sip.StatusCode, reason string, body []byte, headers ...sip.Header) error {
+func (s *DialogServerSession) Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error {
 	// Must copy Record-Route headers. Done by this command
 	res := sip.NewResponseFromRequest(s.InviteRequest, statusCode, reason, body)
 
@@ -309,6 +318,39 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		return err
 	}
 
+	// Wait now for ACK for our 2xx
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
+
+	// We are following RFC 6026, which states that this is TU thing and not Transaction layer.
+	timer := time.NewTimer(sip.T1)
+	defer timer.Stop()
+
+	state := sip.DialogStateEstablished
+	readStateCh := s.StateRead()
+	for state == sip.DialogStateEstablished {
+		select {
+		case <-timer.C:
+			if err := tx.Respond(res); err != nil {
+				return err
+			}
+			// 2xx response is passed to the transport with an
+			//    interval that starts at T1 seconds and doubles for each
+			//    retransmission until it reaches T2 seconds (T1 and T2 are defined in
+			//    Section 17).
+			timer.Reset(max(2*sip.T1, sip.T2))
+
+		case <-time.After(64 * sip.T1):
+			// If the server retransmits the 2xx response for 64*T1 seconds without
+			// receiving an ACK, the dialog is confirmed, but the session SHOULD be
+			// terminated.  This is accomplished with a BYE, as described in Section
+			// 15.
+			state = sip.DialogStateConfirmed
+		case state = <-readStateCh:
+		}
+	}
+	if state != sip.DialogStateConfirmed {
+		return fmt.Errorf("No ACK received")
+	}
 	return nil
 }
 

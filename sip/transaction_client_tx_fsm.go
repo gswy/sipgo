@@ -97,11 +97,11 @@ func (tx *ClientTx) inviteStateAccepted(s fsmInput) fsmInput {
 		//  received while the client INVITE state machine is in the "Calling" or
 		//  "Proceeding" states, it MUST transition to the "Accepted" state, pass
 		//  the 2xx response to the TU, and set Timer M to 64*T1
-		tx.log.Debug().Msg("retransimission 2xx detected")
+		tx.log.Debug("retransimission 2xx detected", "tx", tx.Key())
 		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actPassupRetransmission
 
 	case client_input_transport_err:
-		tx.log.Warn().Msg("client transport error detected. Waiting for retransmission")
+		tx.log.Warn("client transport error detected. Waiting for retransmission", "tx", tx.Key())
 		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actTranErrNoDelete
 	case client_input_timer_m:
 		tx.fsmState, spinfn = tx.inviteStateTerminated, tx.actDelete
@@ -342,7 +342,7 @@ func (tx *ClientTx) actAckResend() fsmInput {
 	if tx.fsmAck != nil {
 		// ACK was sent. Now delay to prevent infinite loop as temporarly fix
 		// This is not clear per RFC, but client could generate a lot requests in this case
-		tx.log.Error().Msg("ACK loop retransimission. Resending after T2")
+		tx.log.Error("ACK loop retransimission. Resending after T2", "tx", tx.Key())
 		select {
 		case <-tx.done:
 			return FsmInputNone
@@ -408,7 +408,10 @@ func (tx *ClientTx) actPassupAccept() fsmInput {
 }
 
 func (tx *ClientTx) actDelete() fsmInput {
-	tx.delete()
+	if tx.fsmErr == nil {
+		tx.fsmErr = ErrTransactionTerminated
+	}
+	tx.delete(tx.fsmErr)
 	return FsmInputNone
 }
 
@@ -442,13 +445,28 @@ func (tx *ClientTx) passUpRetransmission() {
 		return
 	}
 
+	// Only hook based should handle retransmission
+	tx.mu.Lock()
+	onResp := tx.onRetransmission
+	tx.mu.Unlock()
+
+	// To consider: passing via hook can be better to avoid deadlock
+	if onResp != nil {
+		tx.fsmMu.Unlock() // Avoids potential deadlock
+		onResp(lastResp)
+		tx.fsmMu.Lock()
+		return
+	}
+
+	tx.log.Debug("skipped response. Retransimission", "tx", tx.Key())
+
 	// Client probably left or not interested, so therefore we must not block here
 	// For proxies they should handle this retransmission
-	select {
-	case <-tx.done:
-	case tx.responses <- lastResp:
-		// TODO is T1 best here option? This can take Timer_M as 64*T1
-	case <-time.After(T1):
-		tx.log.Debug().Msg("skipped response. Retransimission")
-	}
+	// select {
+	// case <-tx.done:
+	// case tx.responses <- lastResp:
+	// 	// TODO is T1 best here option? This can take Timer_M as 64*T1
+	// case <-time.After(T1):
+	// 	tx.log.Debug("skipped response. Retransimission", "tx", tx.Key())
+	// }
 }

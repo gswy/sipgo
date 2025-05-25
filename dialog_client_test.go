@@ -2,7 +2,10 @@ package sipgo
 
 import (
 	"context"
+	"log/slog"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/emiago/sipgo/sip"
 	"github.com/emiago/sipgo/siptest"
@@ -15,6 +18,16 @@ func testClient(t testing.TB, f func(req *sip.Request) *sip.Response) *Client {
 	client, err := NewClient(ua)
 	require.NoError(t, err)
 	client.TxRequester = &siptest.ClientTxRequester{
+		OnRequest: f,
+	}
+	return client
+}
+
+func testClientResponder(t testing.TB, f func(req *sip.Request, w *siptest.ClientTxResponder)) *Client {
+	ua, _ := NewUA()
+	client, err := NewClient(ua)
+	require.NoError(t, err)
+	client.TxRequester = &siptest.ClientTxRequesterResponder{
 		OnRequest: f,
 	}
 	return client
@@ -41,13 +54,14 @@ func TestDialogClientRequestRecordRouteHeaders(t *testing.T) {
 		resp.AppendHeader(sip.NewHeader("Record-Route", "<sip:p1.com;lr>"))
 
 		s := DialogClientSession{
-			ua: &DialogUA{
+			UA: &DialogUA{
 				Client: client,
 			},
 			Dialog: Dialog{
 				InviteRequest:  invite,
 				InviteResponse: resp,
 			},
+			inviteTx: sip.NewClientTx("test", invite, nil, slog.Default()),
 		}
 		// Send canceled request
 		ctx, cancel := context.WithCancel(context.Background())
@@ -76,13 +90,14 @@ func TestDialogClientRequestRecordRouteHeaders(t *testing.T) {
 		resp.AppendHeader(sip.NewHeader("Record-Route", "<sip:p1.com>"))
 
 		s := DialogClientSession{
-			ua: &DialogUA{
+			UA: &DialogUA{
 				Client: client,
 			},
 			Dialog: Dialog{
 				InviteRequest:  invite,
 				InviteResponse: resp,
 			},
+			inviteTx: sip.NewClientTx("test", invite, nil, slog.Default()),
 		}
 
 		// Send canceled request
@@ -132,6 +147,41 @@ func TestDialogClientMultiRequest(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, d.InviteRequest.CSeq().SeqNo+1, sentReq.CSeq().SeqNo)
+}
+
+func TestDialogClientACKRetransmission(t *testing.T) {
+	var acks int32
+	client := testClientResponder(t, func(req *sip.Request, w *siptest.ClientTxResponder) {
+		if req.IsAck() {
+			atomic.AddInt32(&acks, 1)
+			return
+		}
+
+		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+		w.Receive(res)
+		time.Sleep(sip.T1)
+		w.Receive(res)
+		time.Sleep(sip.T1)
+		w.Receive(res)
+	})
+
+	dua := DialogUA{
+		Client: client,
+	}
+	d, err := dua.Invite(context.TODO(), sip.Uri{User: "test", Host: "localhost"}, nil)
+	require.NoError(t, err)
+	err = d.WaitAnswer(context.TODO(), AnswerOptions{})
+	require.NoError(t, err)
+
+	// We will keep receiving retransmission
+	if err := d.Ack(context.TODO()); err != nil {
+		t.Error(err)
+	}
+	time.Sleep(4 * sip.T1)
+	// It should retransmit
+	state := d.LoadState()
+	assert.Equal(t, sip.DialogStateConfirmed, state)
+	assert.EqualValues(t, 3, atomic.LoadInt32(&acks))
 }
 
 func BenchmarkDialogDo(b *testing.B) {

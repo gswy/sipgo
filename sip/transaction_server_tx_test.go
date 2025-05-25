@@ -2,18 +2,19 @@ package sip
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/emiago/sipgo/fakes"
-	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
 )
 
 func TestServerTransactionFSM(t *testing.T) {
 	// SetTimers(1*time.Millisecond, 1*time.Millisecond, 1*time.Millisecond)
-	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "UDP", "127.0.0.2:5060")
 
 	incoming := bytes.NewBuffer([]byte{})
 	outgoing := bytes.NewBuffer([]byte{})
@@ -25,12 +26,19 @@ func TestServerTransactionFSM(t *testing.T) {
 				Writers: map[string]io.Writer{"127.0.0.2:5060": outgoing},
 			},
 		}
-		tx := NewServerTx("123", req, conn, log.Logger)
+		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
 
 		err = tx.Receive(req)
 		require.NoError(t, err)
+
+		require.NoError(t, tx.Err())
+		select {
+		case <-tx.Done():
+			t.Error("Transaction should not terminate")
+		default:
+		}
 	})
 
 	t.Run("OutOfOrderResponse", func(t *testing.T) {
@@ -40,7 +48,7 @@ func TestServerTransactionFSM(t *testing.T) {
 				Writers: map[string]io.Writer{"127.0.0.2:5060": outgoing},
 			},
 		}
-		tx := NewServerTx("123", req, conn, log.Logger)
+		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
 
@@ -73,7 +81,7 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 
 	t.Run("UDP", func(t *testing.T) {
 		req := testCreateRequest(t, "OPTIONS", "sip:example.com", "UDP", "127.0.0.1:5060")
-		tx := NewServerTx("123", req, conn, log.Logger)
+		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
 
@@ -92,7 +100,7 @@ func TestServerTransactionNonInviteFSM(t *testing.T) {
 
 	t.Run("TCP", func(t *testing.T) {
 		req := testCreateRequest(t, "OPTIONS", "sip:example.com", "TCP", "127.0.0.1:5060")
-		tx := NewServerTx("123", req, conn, log.Logger)
+		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
 
@@ -124,7 +132,7 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 				Writers: map[string]io.Writer{"127.0.0.2:5060": outgoing},
 			},
 		}
-		tx := NewServerTx("123", req, conn, log.Logger)
+		tx := NewServerTx("123", req, conn, slog.Default())
 		err := tx.Init()
 		require.NoError(t, err)
 
@@ -153,4 +161,13 @@ func TestServerTransactionFSMInvite(t *testing.T) {
 			return compareFunctions(tx.currentFsmState(), tx.inviteStateTerminated) == nil
 		}, 10*Timer_I, Timer_I)
 	})
+}
+
+func TestServerTransactionContext(t *testing.T) {
+	req, _, _ := testCreateInvite(t, "sip:127.0.0.99:5060", "udp", "127.0.0.2:5060")
+	tx := NewServerTx("123", req, nil, slog.Default())
+	ctx := ServerTransactionContext(tx)
+	tx.Terminate()
+	require.Equal(t, context.Canceled, ctx.Err())
+	require.Equal(t, ErrTransactionTerminated, tx.Err())
 }

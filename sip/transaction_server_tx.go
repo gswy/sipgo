@@ -1,12 +1,9 @@
 package sip
 
 import (
-	"context"
 	"fmt"
-	"sync"
+	"log/slog"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
 type ServerTx struct {
@@ -24,11 +21,9 @@ type ServerTx struct {
 	timer_1xx    *time.Timer
 	timer_l      *time.Timer
 	reliable     bool
-
-	closeOnce sync.Once
 }
 
-func NewServerTx(key string, origin *Request, conn Connection, logger zerolog.Logger) *ServerTx {
+func NewServerTx(key string, origin *Request, conn Connection, logger *slog.Logger) *ServerTx {
 	tx := new(ServerTx)
 	tx.key = key
 	tx.conn = conn
@@ -66,13 +61,17 @@ func (tx *ServerTx) Init() error {
 			)
 			// tx.Log().Trace("timer_1xx fired")
 			if err := tx.Respond(trying); err != nil {
-				tx.log.Error().Err(err).Msg("send '100 Trying' response failed")
+				tx.log.Error("send '100 Trying' response failed", "error", err, "tx", tx.Key())
 			}
 		})
 		tx.mu.Unlock()
 	}
-	tx.log.Debug().Str("tx", tx.Key()).Msg("Server transaction initialized")
+	tx.log.Debug("Server transaction initialized", "tx", tx.Key())
 	return nil
+}
+
+func (tx *ServerTx) Connection() Connection {
+	return tx.conn
 }
 
 // Receive is endpoint for handling received server requests.
@@ -133,22 +132,10 @@ func (tx *ServerTx) Acks() <-chan *Request {
 	return tx.acks
 }
 
-func (tx *ServerTx) Context() context.Context {
-	return tx
-}
-
-// This adding this to be context compatible
-func (tx *ServerTx) Deadline() (deadline time.Time, ok bool) {
-	return time.Time{}, false
-}
-func (tx *ServerTx) Value(v any) (k any) {
-	return nil
-}
-
 func (tx *ServerTx) ackSend(r *Request) {
 	select {
 	case <-tx.done:
-		tx.log.Warn().Str("callid", r.CallID().Value()).Msg("ACK missed")
+		tx.log.Warn("ACK missed", "callid", r.CallID().Value(), "tx", tx.Key())
 	case tx.acks <- r:
 	}
 }
@@ -164,15 +151,14 @@ func (tx *ServerTx) ackSendAsync(r *Request) {
 	go tx.ackSend(r)
 }
 
-func (tx *ServerTx) OnCancel(f func(r *Request)) {
-	tx.mu.Lock()
-	defer tx.mu.Unlock()
-	tx.onCancel = f
-}
-
 func (tx *ServerTx) Terminate() {
-	tx.log.Debug().Msg("Server transaction terminating")
-	tx.delete()
+	tx.log.Debug("Server transaction terminating", "tx", tx.Key())
+	if tx.delete(ErrTransactionTerminated) {
+		// TODO: remove this double locking
+		tx.fsmMu.Lock()
+		tx.fsmErr = ErrTransactionTerminated
+		tx.fsmMu.Unlock()
+	}
 }
 
 // TerminateGracefully allows retransmission to happen before shuting down transaction
@@ -191,8 +177,41 @@ func (tx *ServerTx) TerminateGracefully() {
 		tx.Terminate()
 		return
 	}
-	tx.log.Debug().Msg("Server transaction waiting termination")
+	tx.log.Debug("Server transaction waiting termination")
 	<-tx.Done()
+}
+
+// OnCancel is experimental
+// It is racy thing if not registered after transaction creation
+func (tx *ServerTx) OnCancel(f FnTxCancel) bool {
+	tx.mu.Lock()
+	if tx.closed {
+		tx.mu.Unlock()
+		return false
+	}
+	tx.registerOnCancel(f)
+	tx.mu.Unlock()
+
+	// Check is transaction already canceled
+	// Problem is that transaction is marked canceled but not terminated yet
+	// TODO move this check under single lock after removing this double locks
+	if tx.Err() == ErrTransactionCanceled {
+		return false
+	}
+
+	return true
+}
+
+func (tx *ServerTx) registerOnCancel(f FnTxCancel) {
+	if tx.onCancel != nil {
+		prev := tx.onCancel
+		tx.onCancel = func(r *Request) {
+			prev(r)
+			f(r)
+		}
+		return
+	}
+	tx.onCancel = f
 }
 
 // Choose the right FSM init function depending on request method.
@@ -204,24 +223,15 @@ func (tx *ServerTx) initFSM() {
 	}
 }
 
-func (tx *ServerTx) delete() {
-	tx.closeOnce.Do(func() {
-		tx.mu.Lock()
-		close(tx.done)
-		onterm := tx.onTerminate
-		tx.mu.Unlock()
-		if onterm != nil {
-			onterm(tx.key)
-		}
-		// TODO with ref this can be added, but normally we expect client does closing
-		// if _, err := tx.conn.TryClose(); err != nil {
-		// 	tx.log.Info().Err(err).Msg("Closing connection returned error")
-		// }
-	})
-
-	// time.Sleep(time.Microsecond)
-
+func (tx *ServerTx) delete(err error) bool {
 	tx.mu.Lock()
+	if tx.closed {
+		tx.mu.Unlock()
+		return false
+	}
+	tx.closed = true
+	close(tx.done)
+
 	if tx.timer_i != nil {
 		tx.timer_i.Stop()
 		tx.timer_i = nil
@@ -243,6 +253,14 @@ func (tx *ServerTx) delete() {
 		tx.timer_1xx.Stop()
 		tx.timer_1xx = nil
 	}
+
+	key := tx.key
+	onterm := tx.onTerminate
 	tx.mu.Unlock()
-	tx.log.Debug().Str("tx", tx.Key()).Msg("Server transaction destroyed")
+
+	tx.log.Debug("Server transaction destroyed", "tx", key)
+	if onterm != nil {
+		onterm(key, err)
+	}
+	return true
 }

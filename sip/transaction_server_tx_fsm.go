@@ -2,7 +2,6 @@
 package sip
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -74,6 +73,10 @@ func (tx *ServerTx) inviteStateAccepted(s fsmInput) fsmInput {
 	case server_input_ack:
 		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actPassupAck
 	case server_input_user_2xx:
+		// The server transaction MUST NOT generate 2xx retransmissions on its
+		// own.  Any retransmission of the 2xx response passed from the TU to
+		// the transaction while in the "Accepted" state MUST be passed to the
+		// transport layer for transmission.
 		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actRespond
 	case server_input_timer_l:
 		tx.fsmState, spinfn = tx.inviteStateTerminated, tx.actDelete
@@ -247,35 +250,22 @@ func (tx *ServerTx) actFinal() fsmInput {
 
 // Inform user of transport error
 func (tx *ServerTx) actTransErr() fsmInput {
-	tx.log.Debug().Err(tx.fsmErr).Msg("Transport error. Transaction will terminate")
+	tx.log.Debug("Transport error. Transaction will terminate", "fsmError", tx.fsmErr, "tx", tx.Key())
 	return server_input_delete
 }
 
-// Inform user of timeout error
+// Inform user of timeout fsmError
 func (tx *ServerTx) actTimeout() fsmInput {
-	tx.log.Debug().Err(tx.fsmErr).Msg("Timed out. Transaction will terminate")
+	tx.log.Debug("Timed out. Transaction will terminate", "fsmError", tx.fsmErr, "tx", tx.Key())
 	return server_input_delete
 }
 
 // Just delete the transaction.
 func (tx *ServerTx) actDelete() fsmInput {
-	tx.delete()
-
-	return FsmInputNone
-}
-
-// Send response and delete the transaction.
-func (tx *ServerTx) actRespondDelete() fsmInput {
-	// tx.Log().Debug("actRespondDelete")
-	tx.delete()
-	err := tx.conn.WriteMsg(tx.fsmResp)
-
-	if err != nil {
-		tx.fsmErr = wrapTransportError(err)
-		tx.log.Debug().Err(err).Msg("fail to actRespondDelete")
-		return server_input_transport_err
+	if tx.fsmErr == nil {
+		tx.fsmErr = ErrTransactionTerminated
 	}
-
+	tx.delete(tx.fsmErr)
 	return FsmInputNone
 }
 
@@ -310,13 +300,19 @@ func (tx *ServerTx) actCancel() fsmInput {
 	if r == nil {
 		return FsmInputNone
 	}
-	// Check is there some listener on cancel
-	if tx.onCancel != nil {
-		tx.onCancel(r)
-	}
-	tx.log.Debug().Msg("Passing 487 on CANCEL")
+
+	tx.log.Debug("Passing 487 on CANCEL", "tx", tx.Key())
 	tx.fsmResp = NewResponseFromRequest(tx.origin, StatusRequestTerminated, "Request Terminated", nil)
 	tx.fsmErr = ErrTransactionCanceled // For now only informative
+
+	// Check is there some listener on cancel
+	tx.mu.Lock()
+	onCancel := tx.onCancel
+	tx.mu.Unlock()
+	if onCancel != nil {
+		onCancel(r)
+	}
+
 	return server_input_user_300_plus
 }
 
@@ -346,13 +342,15 @@ func (tx *ServerTx) passResp() error {
 	lastResp := tx.fsmResp
 
 	if lastResp == nil {
-		return fmt.Errorf("none response")
+		// We may have received multiple request but without any response
+		// placed yet in transaction
+		return nil
 	}
 
 	// tx.Log().Debug("actFinal")
 	err := tx.conn.WriteMsg(lastResp)
 	if err != nil {
-		tx.log.Debug().Err(err).Str("res", lastResp.StartLine()).Msg("fail to pass response")
+		tx.log.Debug("fail to pass response", "error", err, "res", lastResp.StartLine(), "tx", tx.Key())
 		tx.fsmErr = wrapTransportError(err)
 		return err
 	}

@@ -22,10 +22,14 @@ type DialogUA struct {
 }
 
 func (c *DialogUA) ReadInvite(inviteReq *sip.Request, tx sip.ServerTransaction) (*DialogServerSession, error) {
-	cont := inviteReq.Contact()
-	if cont == nil {
+	// do some minimal validation
+	if inviteReq.Contact() == nil {
 		return nil, ErrDialogInviteNoContact
 	}
+	if inviteReq.CSeq() == nil {
+		return nil, fmt.Errorf("no CSEQ header present")
+	}
+
 	// Prebuild already to tag for response as it must be same for all responds
 	// NewResponseFromRequest will skip this for all 100
 	uuid, err := uuid.NewV4()
@@ -38,15 +42,6 @@ func (c *DialogUA) ReadInvite(inviteReq *sip.Request, tx sip.ServerTransaction) 
 		return nil, err
 	}
 
-	// do some minimal validation
-	if inviteReq.CSeq() == nil {
-		return nil, fmt.Errorf("no CSEQ header present")
-	}
-
-	if inviteReq.Contact() == nil {
-		return nil, fmt.Errorf("no Contact header present")
-	}
-
 	dtx := &DialogServerSession{
 		Dialog: Dialog{
 			ID:            id, // this id has already prebuilt tag
@@ -57,15 +52,37 @@ func (c *DialogUA) ReadInvite(inviteReq *sip.Request, tx sip.ServerTransaction) 
 	}
 	dtx.Init()
 
-	// Temporarly fix
-	if stx, ok := tx.(*sip.ServerTx); ok {
-		stx.OnTerminate(func(key string) {
-			state := dtx.LoadState()
-			if state < sip.DialogStateEstablished {
-				// It is canceled if transaction died before answer
-				dtx.setState(sip.DialogStateEnded)
-			}
-		})
+	if !tx.OnCancel(func(r *sip.Request) {
+		state := dtx.LoadState()
+		if state < sip.DialogStateEstablished {
+			// It is mostly canceled if transaction died before answer
+			// NOTE this only happens if we sent provisional and before final response
+			dtx.endWithCause(sip.ErrTransactionCanceled)
+		}
+	}) {
+		if err := tx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("transaction terminated already")
+	}
+
+	if !tx.OnTerminate(func(key string, err error) {
+		// NOTE: do not call any here tx FSM related functions as they can cause deadlock
+		state := dtx.LoadState()
+		if state < sip.DialogStateEstablished {
+			// It is mostly canceled if transaction died before answer
+			// NOTE this only happens if we sent provisional and before final response
+			// if err == sip.ErrTransactionCanceled {
+			// 	dtx.endWithCause(sip.ErrTransactionCanceled)
+			// 	return
+			// }
+			dtx.endWithCause(nil)
+		}
+	}) {
+		if err := tx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("transaction terminated already")
 	}
 
 	return dtx, nil
@@ -84,26 +101,32 @@ func (ua *DialogUA) Invite(ctx context.Context, recipient sip.Uri, body []byte, 
 }
 
 func (c *DialogUA) WriteInvite(ctx context.Context, inviteReq *sip.Request, options ...ClientRequestOption) (*DialogClientSession, error) {
-	cli := c.Client
-
 	if inviteReq.Contact() == nil {
 		// Set contact only if not exists
 		inviteReq.AppendHeader(&c.ContactHDR)
-	}
-
-	tx, err := cli.TransactionRequest(ctx, inviteReq, options...)
-	if err != nil {
-		return nil, err
 	}
 
 	dtx := &DialogClientSession{
 		Dialog: Dialog{
 			InviteRequest: inviteReq,
 		},
-		ua:       c,
-		inviteTx: tx,
+		UA: c,
 	}
-	dtx.Init()
+	// Init our dialog
+	dtx.Dialog.Init()
 
-	return dtx, nil
+	return dtx, dtx.Invite(ctx, options...)
+}
+
+func (d *DialogClientSession) Invite(ctx context.Context, options ...ClientRequestOption) error {
+	cli := d.UA.Client
+	inviteReq := d.InviteRequest
+
+	var err error
+	d.inviteTx, err = cli.TransactionRequest(ctx, inviteReq, options...)
+	if err == nil {
+		d.lastCSeqNo.Store(inviteReq.CSeq().SeqNo)
+	}
+
+	return err
 }

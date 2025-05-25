@@ -5,12 +5,10 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
-
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -36,13 +34,23 @@ type TransportLayer struct {
 
 	handlers []MessageHandler
 
-	log zerolog.Logger
+	log *slog.Logger
 
 	// ConnectionReuse will force connection reuse when passing request
 	ConnectionReuse bool
 
 	// PreferSRV does always SRV lookup first
 	DNSPreferSRV bool
+}
+
+type TransportLayerOption func(l *TransportLayer)
+
+func WithTransportLayerLogger(logger *slog.Logger) TransportLayerOption {
+	return func(l *TransportLayer) {
+		if logger != nil {
+			l.log = logger.With("caller", "TransportLayer")
+		}
+	}
 }
 
 // NewLayer creates transport layer.
@@ -53,29 +61,61 @@ func NewTransportLayer(
 	dnsResolver *net.Resolver,
 	sipparser *Parser,
 	tlsConfig *tls.Config,
+	option ...TransportLayerOption,
 ) *TransportLayer {
 	l := &TransportLayer{
 		transports:      make(map[string]Transport),
 		listenPorts:     make(map[string][]int),
 		dnsResolver:     dnsResolver,
 		ConnectionReuse: true,
+		log:             slog.With("caller", "TransportLayer"),
 	}
 
-	l.log = log.Logger.With().Str("caller", "transportlayer").Logger()
+	for _, o := range option {
+		o(l)
+	}
 
 	if tlsConfig == nil {
 		// Use empty tls config
 		tlsConfig = &tlsEmptyConf
 	}
-	// TODO consider this transports are configurable from outside
-	// Make some default transports available.
-	l.udp = newUDPTransport(sipparser)
-	l.tcp = newTCPTransport(sipparser)
+
+	// Exporting transport configuration
+	// UDP
+	l.udp = &transportUDP{
+		log: l.log.With("caller", "Transport<UDP>"),
+	}
+	l.udp.init(sipparser)
+
+	// TCP
+	l.tcp = &transportTCP{
+		log: l.log.With("caller", "Transport<TCP>"),
+	}
+	l.tcp.init(sipparser)
+
+	// TLS
 	// TODO. Using default dial tls, but it needs to configurable via client
-	l.tls = newTLSTransport(sipparser, tlsConfig)
-	l.ws = newWSTransport(sipparser)
+	l.tls = &transportTLS{
+		transportTCP: &transportTCP{
+			log: l.log.With("caller", "Transport<TLS>"),
+		},
+	}
+	l.tls.init(sipparser, tlsConfig)
+
+	// WS
+	l.ws = &transportWS{
+		log: l.log.With("caller", "Transport<WS>"),
+	}
+	l.ws.init(sipparser)
+
+	// WSS
 	// TODO. Using default dial tls, but it needs to configurable via client
-	l.wss = newWSSTransport(sipparser, tlsConfig)
+	l.wss = &transportWSS{
+		transportWS: &transportWS{
+			log: l.log.With("caller", "Transport<WSS>"),
+		},
+	}
+	l.wss.init(sipparser, tlsConfig)
 
 	// Fill map for fast access
 	l.transports["udp"] = l.udp
@@ -172,7 +212,6 @@ func (l *TransportLayer) ServeWSS(c net.Listener) error {
 	if err != nil {
 		return err
 	}
-
 	l.addListenPort("wss", port)
 
 	return l.wss.Serve(c, l.handleMessage)
@@ -338,108 +377,78 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 		return nil, fmt.Errorf("missing Via Header")
 	}
 
-	laddr := Addr{
-		IP: net.ParseIP(viaHop.Host),
-		// IP:   lIP,
-		Port: viaHop.Port,
-	}
+	// Clients need to be able to bind request to IP:port.
+	// Via host and port may not be same, as client would use some advertised host:port if present
+	// In case not present in VIA, transport will override with real connection and IP
+	// This makes sure that alwasy valid Via Header is set.
+	// Client must guarantee that Via Header is added and present in each request.
 
-	// Always check does connection exists if full IP:port provided
+	// Should we use default transport ports here?
+	laddr := req.Laddr
+
 	// This is probably client forcing host:port
 	if laddr.IP != nil && laddr.Port > 0 {
-		c, _ = transport.GetConnection(laddr.String())
-		if c != nil {
-			return c, nil
-		}
+		c = transport.GetConnection(laddr.String())
 	} else if l.ConnectionReuse {
 		// viaHop.Params.Add("alias", "")
 		addr := raddr.String()
-
-		c, _ := transport.GetConnection(addr)
-		if c != nil {
-			// Update Via sent by
-			la := c.LocalAddr()
-			network := la.Network()
-			laStr := la.String()
-
-			// TODO handle broadcast address
-			// TODO avoid this parsing
-			host, port, err := ParseAddr(laStr)
-			if err != nil {
-				return nil, fmt.Errorf("fail to parse local connection address network=%s addr=%s: %w", network, laStr, err)
-			}
-
-			// https://datatracker.ietf.org/doc/html/rfc3261#section-18
-			// Before a request is sent, the client transport MUST insert a value of
-			// the "sent-by" field into the Via header field.  This field contains
-			// an IP address or host name, and port.  The usage of an FQDN is
-			// RECOMMENDED.
-			if viaHop.Host == "" {
-				viaHop.Host = host
-			}
-			viaHop.Port = port
-			return c, nil
-		}
-
-		// In case client handle sets address same as UDP listen addr
-		// try grabbing listener for udp and send packet connectionless
-		/* if c == nil && network == "udp" && laddr.IP != nil && laddr.Port > 0 {
-			c, _ = transport.GetConnection(laddr.String())
-
-			if c != nil {
-				viaHop.Host = laddr.IP.String()
-				viaHop.Port = laddr.Port
-
-				// DO NOT USE unspecified IP with client handle
-				// switch {
-				// case laddr.IP.IsUnspecified():
-				// 	l.log.Warn().Msg("External Via IP address is unspecified for UDP. Using 127.0.0.1")
-				// 	viaHop.Host = "127.0.0.1" // TODO use resolve IP
-				// }
-				return c, nil
-			}
-		} */
-		l.log.Debug().Str("addr", addr).Str("raddr", raddr.String()).Msg("Active connection not found")
+		c = transport.GetConnection(addr)
 	}
 
-	l.log.Debug().Str("host", viaHop.Host).Int("port", viaHop.Port).Str("network", network).Msg("Via header used for creating connection")
+	if c == nil {
+		if l.log.Enabled(ctx, slog.LevelDebug) {
+			// printing laddr adds some execution
+			l.log.Debug("Creating connection", "laddr", laddr.String(), "raddr", raddr.String(), "network", network)
+		}
+		c, err = transport.CreateConnection(ctx, laddr, raddr, l.handleMessage)
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	c, err = transport.CreateConnection(ctx, laddr, raddr, l.handleMessage)
-	if err != nil {
+	if err := l.overrideSentBy(c, viaHop); err != nil {
 		return nil, err
 	}
 
-	// TODO refactor this
-	switch {
-	case viaHop.Host == "" || laddr.IP == nil: // If not specified by UAC we will override Via sent-by
-		fallthrough
-	case viaHop.Port == 0: // We still may need to rewrite sent-by port
-		// TODO avoid this parsing
-		la := c.LocalAddr()
-		laStr := la.String()
-
-		host, port, err = ParseAddr(laStr)
-		if err != nil {
-			return nil, fmt.Errorf("fail to parse local connection address network=%s addr=%s: %w", network, laStr, err)
-		}
-
-		// https://datatracker.ietf.org/doc/html/rfc3261#section-18
-		// Before a request is sent, the client transport MUST insert a value of
-		// the "sent-by" field into the Via header field.  This field contains
-		// an IP address or host name, and port.  The usage of an FQDN is
-		// RECOMMENDED.
-		if viaHop.Host == "" {
-			viaHop.Host = host
-		}
-		viaHop.Port = port
-	}
 	return c, nil
 }
 
+func (l *TransportLayer) overrideSentBy(c Connection, viaHop *ViaHeader) error {
+	if viaHop.Host != "" && viaHop.Port > 0 {
+		// avoids underhood parsing
+		return nil
+	}
+
+	// TODO: can we have non string LAddr to avoid parsing
+	la := c.LocalAddr()
+	laStr := la.String()
+
+	host, port, err := ParseAddr(laStr)
+	if err != nil {
+		return fmt.Errorf("fail to parse local connection address network=%s addr=%s: %w", la.Network(), laStr, err)
+	}
+
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-18
+	// Before a request is sent, the client transport MUST insert a value of
+	// the "sent-by" field into the Via header field.  This field contains
+	// an IP address or host name, and port.  The usage of an FQDN is
+	// RECOMMENDED.
+	// We are overriding only if client did not set this
+	if viaHop.Host == "" {
+		viaHop.Host = host
+	}
+
+	if viaHop.Port == 0 {
+		viaHop.Port = port
+	}
+	return nil
+}
+
 func (l *TransportLayer) resolveAddr(ctx context.Context, network string, host string, addr *Addr) error {
+	log := l.log
 	defer func(start time.Time) {
 		if dur := time.Since(start); dur > 50*time.Millisecond {
-			l.log.Warn().Dur("dur", dur).Msg("DNS resolution is slow")
+			l.log.Warn("DNS resolution is slow", "dur", dur)
 		}
 	}(time.Now())
 
@@ -448,7 +457,7 @@ func (l *TransportLayer) resolveAddr(ctx context.Context, network string, host s
 		if err == nil {
 			return nil
 		}
-		log.Warn().Str("host", host).Err(err).Msg("Doing SRV lookup failed.")
+		log.Warn("Doing SRV lookup failed.", "host", host, "error", err)
 		return l.resolveAddrIP(ctx, host, addr)
 	}
 
@@ -457,12 +466,12 @@ func (l *TransportLayer) resolveAddr(ctx context.Context, network string, host s
 		return nil
 	}
 
-	log.Info().Err(err).Msg("IP addr resolving failed, doing via dns SRV resolver...")
+	log.Info("IP addr resolving failed, doing via dns SRV resolver...", "error", err)
 	return l.resolveAddrSRV(ctx, network, host, addr)
 }
 
 func (l *TransportLayer) resolveAddrIP(ctx context.Context, hostname string, addr *Addr) error {
-	l.log.Debug().Str("host", hostname).Msg("DNS Resolving")
+	l.log.Debug("DNS Resolving", "host", hostname)
 
 	// Do local resolving
 	ips, err := l.dnsResolver.LookupIPAddr(ctx, hostname)
@@ -475,7 +484,9 @@ func (l *TransportLayer) resolveAddrIP(ctx context.Context, hostname string, add
 	}
 
 	for _, ip := range ips {
-		if len(ip.IP) == net.IPv4len {
+		// This is only correct way to check is ipv4.
+		//  len(ip.IP) == net.IPv4len IS NOT working in all cases
+		if ip.IP.To4() != nil {
 			addr.IP = ip.IP
 			return nil
 		}
@@ -485,7 +496,7 @@ func (l *TransportLayer) resolveAddrIP(ctx context.Context, hostname string, add
 }
 
 func (l *TransportLayer) resolveAddrSRV(ctx context.Context, network string, hostname string, addr *Addr) error {
-	log := &l.log
+	log := l.log
 	var proto string
 	switch network {
 	case "udp", "udp4", "udp6":
@@ -496,7 +507,7 @@ func (l *TransportLayer) resolveAddrSRV(ctx context.Context, network string, hos
 		proto = "tcp"
 	}
 
-	log.Debug().Str("proto", proto).Str("host", hostname).Msg("Doing SRV lookup")
+	log.Debug("Doing SRV lookup", "proto", proto, "host", hostname)
 
 	// The returned records are sorted by priority and randomized
 	// by weight within a priority.
@@ -505,7 +516,7 @@ func (l *TransportLayer) resolveAddrSRV(ctx context.Context, network string, hos
 		return fmt.Errorf("fail to lookup SRV for %q: %w", hostname, err)
 	}
 
-	log.Debug().Interface("addrs", addrs).Msg("SRV resolved")
+	log.Debug("SRV resolved", "addrs", addrs)
 	record := addrs[0]
 
 	ips, err := l.dnsResolver.LookupIP(ctx, "ip", record.Target)
@@ -513,7 +524,7 @@ func (l *TransportLayer) resolveAddrSRV(ctx context.Context, network string, hos
 		return err
 	}
 
-	log.Debug().Interface("ips", ips).Str("target", record.Target).Msg("SRV resolved IPS")
+	log.Debug("SRV resolved IPS", "ips", ips, "target", record.Target)
 	addr.IP = ips[0]
 	addr.Port = int(record.Port)
 
@@ -536,23 +547,25 @@ func (l *TransportLayer) getConnection(network, addr string) (Connection, error)
 		return nil, fmt.Errorf("transport %s is not supported", network)
 	}
 
-	l.log.Debug().Str("network", network).Str("addr", addr).Msg("getting connection")
-	c, err := transport.GetConnection(addr)
-	if err == nil && c == nil {
+	l.log.Debug("getting connection", "network", network, "addr", addr)
+	c := transport.GetConnection(addr)
+	if c == nil {
 		return nil, fmt.Errorf("connection %q does not exist", addr)
 	}
 
-	return c, err
+	return c, nil
 }
 
 func (l *TransportLayer) Close() error {
-	l.log.Debug().Msg("Layer is closing")
+	l.log.Debug("Layer is closing")
 	var werr error
 	for _, t := range l.transports {
 		if err := t.Close(); err != nil {
-			// For now dump last error
-			werr = err
+			werr = errors.Join(werr, err)
 		}
+	}
+	if werr != nil {
+		l.log.Debug("Layer closed with error", "error", werr)
 	}
 	return werr
 }

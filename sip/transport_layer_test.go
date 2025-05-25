@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +32,13 @@ func TestTransportLayerClosing(t *testing.T) {
 func TestTransportLayerClientConnectionReuse(t *testing.T) {
 	// NOTE it creates real network connection
 	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
-	defer tp.Close()
+	defer func() {
+		require.Empty(t, tp.udp.pool.Size())
+	}()
+	defer func() {
+		require.NoError(t, tp.Close())
+	}()
+
 	require.True(t, tp.ConnectionReuse)
 
 	t.Run("Default", func(t *testing.T) {
@@ -52,13 +59,15 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 
 	t.Run("WithClientHostPort", func(t *testing.T) {
 		req := NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
-		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 12345, Params: NewParams()})
+		req.AppendHeader(&ViaHeader{Host: "localhost", Port: 12345, Params: NewParams()})
+		req.Laddr = testCreateAddr(t, "127.0.0.1:12345")
 
 		conn, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
 
 		req = NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
-		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 12345, Params: NewParams()})
+		req.AppendHeader(&ViaHeader{Host: "localhost", Port: 12345, Params: NewParams()})
+		req.Laddr = testCreateAddr(t, "127.0.0.1:12345")
 
 		conn2, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
@@ -67,6 +76,7 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 		// Now same destination but forcing port
 		req = NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
 		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 9876, Params: NewParams()})
+		req.Laddr = testCreateAddr(t, "127.0.0.1:9876")
 		conn3, err := tp.ClientRequestConnection(context.TODO(), req)
 
 		require.NoError(t, err)
@@ -77,7 +87,12 @@ func TestTransportLayerClientConnectionReuse(t *testing.T) {
 func TestTransportLayerClientConnectionNoReuse(t *testing.T) {
 	// NOTE it creates real network connection
 	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
-	defer tp.Close()
+	defer func() {
+		require.Empty(t, tp.udp.pool.Size())
+	}()
+	defer func() {
+		require.NoError(t, tp.Close())
+	}()
 	tp.ConnectionReuse = false
 
 	t.Run("Default", func(t *testing.T) {
@@ -99,12 +114,14 @@ func TestTransportLayerClientConnectionNoReuse(t *testing.T) {
 	t.Run("WithClientHostPort", func(t *testing.T) {
 		req := NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
 		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 12345, Params: NewParams()})
+		req.Laddr = testCreateAddr(t, "127.0.0.1:12345")
 
 		conn, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
 
 		req = NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
 		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 12345, Params: NewParams()})
+		req.Laddr = testCreateAddr(t, "127.0.0.1:12345")
 
 		conn2, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
@@ -113,6 +130,7 @@ func TestTransportLayerClientConnectionNoReuse(t *testing.T) {
 		// Now same destination but forcing port
 		req = NewRequest(OPTIONS, Uri{Host: "localhost", Port: 5066})
 		req.AppendHeader(&ViaHeader{Host: "127.0.0.1", Port: 9876, Params: NewParams()})
+		req.Laddr = testCreateAddr(t, "127.0.0.1:9876")
 		conn3, err := tp.ClientRequestConnection(context.TODO(), req)
 		require.NoError(t, err)
 
@@ -137,4 +155,16 @@ func TestTransportLayerDefaultPort(t *testing.T) {
 			require.Equal(t, "127.0.0.99:5060", req.Destination())
 		})
 	}
+}
+
+func TestTransportLayerResolving(t *testing.T) {
+	// NOTE it creates real network connection
+
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	addr := Addr{}
+	err := tp.resolveAddr(context.TODO(), "udp", "localhost", &addr)
+	require.NoError(t, err)
+
+	assert.True(t, addr.IP.To4() != nil)
+	assert.Equal(t, "127.0.0.1:0", addr.String())
 }

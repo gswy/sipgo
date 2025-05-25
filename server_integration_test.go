@@ -167,7 +167,7 @@ func TestIntegrationClientServer(t *testing.T) {
 			require.NoError(t, err)
 
 			res := <-tx.Responses()
-			assert.Equal(t, sip.StatusCode(200), res.StatusCode)
+			assert.Equal(t, 200, res.StatusCode)
 
 			tx.Terminate()
 		})
@@ -283,11 +283,12 @@ func BenchmarkIntegrationClientServer(t *testing.B) {
 						maxInvitesPerSec <- struct{}{}
 					}
 					req := sip.NewRequest(sip.INVITE, sip.Uri{User: "bob", Host: shost, Port: sport, Scheme: proto})
+					req.SetTransport(tc.transport)
 					tx, err := client.TransactionRequest(ctx, req)
 					require.NoError(t, err)
 
 					res := <-tx.Responses()
-					assert.Equal(t, sip.StatusCode(200), res.StatusCode)
+					assert.Equal(t, 200, res.StatusCode)
 
 					tx.Terminate()
 				}

@@ -15,7 +15,7 @@ type DialogClientSession struct {
 	Dialog
 	// dc       *DialogClient
 	inviteTx sip.ClientTransaction
-	ua       *DialogUA
+	UA       *DialogUA
 
 	// onClose triggers when user calls Close
 	onClose func()
@@ -91,17 +91,21 @@ func (s *DialogClientSession) Do(ctx context.Context, req *sip.Request) (*sip.Re
 func (s *DialogClientSession) TransactionRequest(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
 	s.buildReq(req)
 	// Passing option to avoid CSEQ apply
-	return s.ua.Client.TransactionRequest(ctx, req, s.addVia)
+	return s.UA.Client.TransactionRequest(ctx, req, s.requestValidate)
 }
 
 func (s *DialogClientSession) WriteRequest(req *sip.Request) error {
 	s.buildReq(req)
-	return s.ua.Client.WriteRequest(req, s.addVia)
+	return s.UA.Client.WriteRequest(req, s.requestValidate)
 }
 
-func (s *DialogClientSession) addVia(c *Client, req *sip.Request) error {
+func (s *DialogClientSession) requestValidate(c *Client, req *sip.Request) error {
 	if req.Via() == nil {
 		ClientRequestAddVia(c, req)
+	}
+	// Makes sure Content-Length is present
+	if req.Body() == nil {
+		req.SetBody(nil)
 	}
 	return nil
 }
@@ -165,16 +169,18 @@ func (s *DialogClientSession) buildReq(req *sip.Request) {
 				// this is strict routing
 				req.Recipient = rh.Address
 			}
-		} else if s.ua.RewriteContact {
+		} else if s.UA.RewriteContact {
 			req.SetDestination(s.InviteResponse.Source())
 		}
 	}
 
 	if h := req.Contact(); h == nil {
-		req.AppendHeader(sip.HeaderClone(&s.ua.ContactHDR))
+		req.AppendHeader(sip.HeaderClone(&s.UA.ContactHDR))
 	}
 
 	s.lastCSeqNo.Store(cseq.SeqNo)
+	// Make sure transport matches original invite
+	req.SetTransport(s.InviteRequest.Transport())
 }
 
 // Close must be always called in order to cleanup some internal resources
@@ -371,6 +377,24 @@ func (s *DialogClientSession) Ack(ctx context.Context) error {
 }
 
 func (s *DialogClientSession) WriteAck(ctx context.Context, ack *sip.Request) error {
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.2.2.4
+	//
+	// Once the ACK has been constructed, the procedures of [4] are used to
+	// determine the destination address, port and transport.  However, the
+	// request is passed to the transport layer directly for transmission,
+	// rather than a client transaction.  This is because the UAC core
+	// handles retransmissions of the ACK, not the transaction layer.
+	s.inviteTx.OnRetransmission(func(r *sip.Response) {
+		// Detect retransmission
+		if r.StatusCode != 200 {
+			return
+		}
+
+		if err := s.WriteRequest(ack); err != nil {
+			s.endWithCause(fmt.Errorf("ACK retransmission failed: %w", err))
+		}
+	})
+
 	if err := s.WriteRequest(ack); err != nil {
 		// Make sure we close our error
 		// s.Close()

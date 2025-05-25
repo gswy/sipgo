@@ -4,9 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
-
-	"github.com/rs/zerolog/log"
 )
 
 var ()
@@ -20,18 +19,12 @@ type transportTLS struct {
 	tlsClient func(conn net.Conn, hostname string) *tls.Conn
 }
 
-// newTLSTransport needs dialTLSConf for creating connections when dialing
-// tls.Config must not be nil
-func newTLSTransport(par *Parser, dialTLSConf *tls.Config) *transportTLS {
-	tcptrans := newTCPTransport(par)
-	tcptrans.transport = TransportTLS //Override transport
-	p := &transportTLS{
-		transportTCP: tcptrans,
-	}
-
+func (t *transportTLS) init(par *Parser, dialTLSConf *tls.Config) {
+	t.transportTCP.init(par)
+	t.transport = TransportTLS
+	t.tlsConf = dialTLSConf
 	// p.rootPool = roots
-	p.tlsConf = dialTLSConf
-	p.tlsClient = func(conn net.Conn, hostname string) *tls.Conn {
+	t.tlsClient = func(conn net.Conn, hostname string) *tls.Conn {
 		config := dialTLSConf
 
 		if config.ServerName == "" {
@@ -40,12 +33,14 @@ func newTLSTransport(par *Parser, dialTLSConf *tls.Config) *transportTLS {
 		}
 		return tls.Client(conn, config)
 	}
-	p.log = log.Logger.With().Str("caller", "transport<TLS>").Logger()
-	return p
+
+	if t.log == nil {
+		t.log = slog.Default()
+	}
 }
 
 func (t *transportTLS) String() string {
-	return "transport<TLS>"
+	return "Transport<TLS>"
 }
 
 // CreateConnection creates TLS connection for TCP transport
@@ -73,7 +68,7 @@ func (t *transportTLS) CreateConnection(ctx context.Context, laddr Addr, raddr A
 	}
 
 	addr := traddr.String()
-	log.Debug().Str("raddr", addr).Msg("Dialing new connection")
+	t.log.Debug("Dialing new connection", "raddr", addr)
 	// No resolving should happen here
 	conn, err := netDialer.DialContext(ctx, "tcp", addr)
 	if err != nil {

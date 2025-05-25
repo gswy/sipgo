@@ -7,9 +7,6 @@ import (
 	"io"
 	"strconv"
 	"strings"
-
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 // The whitespace characters recognised by the Augmented Backus-Naur Form syntax
@@ -40,7 +37,6 @@ func ParseMessage(msgData []byte) (Message, error) {
 // Parser is implementation of SIPParser
 // It is optimized with faster header parsing
 type Parser struct {
-	log zerolog.Logger
 	// HeadersParsers uses default list of headers to be parsed. Smaller list parser will be faster
 	headersParsers mapHeadersParser
 }
@@ -51,7 +47,6 @@ type ParserOption func(p *Parser)
 // Create a new Parser.
 func NewParser(options ...ParserOption) *Parser {
 	p := &Parser{
-		log:            log.Logger,
 		headersParsers: headersParsers,
 	}
 
@@ -60,13 +55,6 @@ func NewParser(options ...ParserOption) *Parser {
 	}
 
 	return p
-}
-
-// WithServerLogger allows customizing parser logger
-func WithParserLogger(logger zerolog.Logger) ParserOption {
-	return func(p *Parser) {
-		p.log = logger
-	}
 }
 
 // WithHeadersParsers allows customizing parser headers parsers
@@ -116,7 +104,7 @@ func (p *Parser) ParseSIP(data []byte) (msg Message, err error) {
 		}
 	}
 
-	// TODO Use Content Legnth header
+	// TODO Use Content Length header
 	contentLength := getBodyLength(data)
 	if contentLength <= 0 {
 		return msg, nil
@@ -303,7 +291,7 @@ func parseRequestLine(requestLine string, recipient *Uri) (
 //	SIP/2.0 200 OK
 //	SIP/1.0 403 Forbidden
 func parseStatusLine(statusLine string) (
-	sipVersion string, statusCode StatusCode, reasonPhrase string, err error) {
+	sipVersion string, statusCode int, reasonPhrase string, err error) {
 	parts := strings.Split(statusLine, " ")
 	if len(parts) < 3 {
 		err = fmt.Errorf("status line has too few spaces: '%s'", statusLine)
@@ -312,7 +300,7 @@ func parseStatusLine(statusLine string) (
 
 	sipVersion = parts[0]
 	statusCodeRaw, err := strconv.ParseUint(parts[1], 10, 16)
-	statusCode = StatusCode(statusCodeRaw)
+	statusCode = int(statusCodeRaw)
 	reasonPhrase = strings.Join(parts[2:], " ")
 
 	return
